@@ -8,7 +8,7 @@ SET QUOTED_IDENTIFIER ON
 GO
 
 CREATE OR ALTER PROCEDURE [dbo].[usp_DropLoginUserAndAccess]
-    @DbName                 sysname,
+    @DbName                 sysname = NULL,
     @Login                  sysname = N'tabular_user',
     @DropLogin              bit     = 1,
     @OnlyIfUnusedInOtherDbs bit     = 1,  -- safer default
@@ -17,13 +17,85 @@ CREATE OR ALTER PROCEDURE [dbo].[usp_DropLoginUserAndAccess]
     @KillAllDatabases       bit     = 0,  -- 0 = only kill sessions in @DbName; 1 = all sessions for the login
     @RolePrefix             nvarchar(64) = N'managed',  -- must match the prefix used in Create proc
     @DryRun                 bit     = 0,  -- 1 = print what would happen without executing
-    @LogToTable             bit     = 0   -- write actions to dbo.provisioning_log
+    @LogToTable             bit     = 0,  -- write actions to dbo.provisioning_log
+
+    -- Help
+    @Help                   bit     = 0   -- print usage examples and return
 AS
 BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT ON;
 
+    -----------------------------------------------------------------
+    -- Help / usage
+    -----------------------------------------------------------------
+    IF @Help = 1
+    BEGIN
+        PRINT N'=================================================================';
+        PRINT N'  usp_DropLoginUserAndAccess';
+        PRINT N'  Drops a DB user, cleans up managed roles, optionally drops';
+        PRINT N'  the server login.';
+        PRINT N'=================================================================';
+        PRINT N'';
+        PRINT N'PARAMETERS:';
+        PRINT N'  @DbName                sysname        (required) Target database';
+        PRINT N'  @Login                 sysname        = N''tabular_user''';
+        PRINT N'  @DropLogin             bit            = 1 (also drop server login)';
+        PRINT N'  @OnlyIfUnusedInOtherDbs bit           = 1 (skip login drop if mapped elsewhere)';
+        PRINT N'  @ReassignSchemaOwner   bit            = 1 (reassign schemas to dbo before drop)';
+        PRINT N'  @KillSessions          bit            = 0 (kill active sessions first)';
+        PRINT N'  @KillAllDatabases      bit            = 0 (0=target DB only, 1=all DBs)';
+        PRINT N'  @RolePrefix            nvarchar(64)   = N''managed'' (must match Create proc)';
+        PRINT N'  @DryRun                bit            = 0 (preview without executing)';
+        PRINT N'  @LogToTable            bit            = 0 (log to dbo.provisioning_log)';
+        PRINT N'';
+        PRINT N'EXAMPLES:';
+        PRINT N'';
+        PRINT N'  -- 1. Drop user + login from MyDB (defaults)';
+        PRINT N'  EXEC dbo.usp_DropLoginUserAndAccess';
+        PRINT N'      @DbName = N''MyDB'';';
+        PRINT N'';
+        PRINT N'  -- 2. Drop a specific login';
+        PRINT N'  EXEC dbo.usp_DropLoginUserAndAccess';
+        PRINT N'      @DbName = N''MyDB'', @Login = N''app_svc'';';
+        PRINT N'';
+        PRINT N'  -- 3. Dry run — preview what would happen';
+        PRINT N'  EXEC dbo.usp_DropLoginUserAndAccess';
+        PRINT N'      @DbName = N''MyDB'', @Login = N''app_svc'', @DryRun = 1;';
+        PRINT N'';
+        PRINT N'  -- 4. Drop user only, keep server login';
+        PRINT N'  EXEC dbo.usp_DropLoginUserAndAccess';
+        PRINT N'      @DbName = N''MyDB'', @Login = N''app_svc'', @DropLogin = 0;';
+        PRINT N'';
+        PRINT N'  -- 5. Force drop even if login is mapped in other DBs';
+        PRINT N'  EXEC dbo.usp_DropLoginUserAndAccess';
+        PRINT N'      @DbName = N''MyDB'', @Login = N''app_svc'',';
+        PRINT N'      @OnlyIfUnusedInOtherDbs = 0;';
+        PRINT N'';
+        PRINT N'  -- 6. Kill sessions before dropping (target DB only)';
+        PRINT N'  EXEC dbo.usp_DropLoginUserAndAccess';
+        PRINT N'      @DbName = N''MyDB'', @Login = N''app_svc'',';
+        PRINT N'      @KillSessions = 1;';
+        PRINT N'';
+        PRINT N'  -- 7. Kill all sessions across all DBs, log actions';
+        PRINT N'  EXEC dbo.usp_DropLoginUserAndAccess';
+        PRINT N'      @DbName = N''MyDB'', @Login = N''app_svc'',';
+        PRINT N'      @KillSessions = 1, @KillAllDatabases = 1,';
+        PRINT N'      @LogToTable = 1;';
+        PRINT N'=================================================================';
+        RETURN;
+    END
+
     DECLARE @msg nvarchar(2048);
+
+    ---------------------------------------------------------------------------
+    -- @DbName is required for all non-help invocations
+    ---------------------------------------------------------------------------
+    IF @DbName IS NULL
+    BEGIN
+        PRINT N'[FAIL] @DbName is required. Run with @Help = 1 for usage examples.';
+        RETURN;
+    END;
 
     ---------------------------------------------------------------------------
     -- Version guard: requires SQL Server 2017+ (STRING_AGG)
@@ -181,7 +253,7 @@ ELSE
     ---------------------------------------------------------------------------
     BEGIN TRY
         IF OBJECT_ID('tempdb..#ManagedRoles') IS NOT NULL DROP TABLE #ManagedRoles;
-        CREATE TABLE #ManagedRoles (RoleName sysname PRIMARY KEY);
+        CREATE TABLE #ManagedRoles (RoleName sysname COLLATE DATABASE_DEFAULT PRIMARY KEY);
 
         DECLARE @managedPrefix nvarchar(128) = LEFT(@RolePrefix + N'_' + @Login + N'_schema_access', 128);
 
@@ -299,7 +371,7 @@ ELSE
 
     -- Warn about non-online databases that might have this user mapped
     DECLARE @nonOnlineList nvarchar(max);
-    SELECT @nonOnlineList = STRING_AGG(QUOTENAME(name) + N' (' + state_desc + N')', N', ')
+    SELECT @nonOnlineList = STRING_AGG(QUOTENAME(name) + N' (' + state_desc COLLATE DATABASE_DEFAULT + N')', N', ')
     FROM sys.databases
     WHERE state_desc <> N'ONLINE'
       AND database_id > 4;
@@ -309,7 +381,7 @@ ELSE
 
     -- Check if login SID is still mapped in any other online user DBs
     IF OBJECT_ID('tempdb..#LoginUsage') IS NOT NULL DROP TABLE #LoginUsage;
-    CREATE TABLE #LoginUsage (db_name sysname NOT NULL PRIMARY KEY);
+    CREATE TABLE #LoginUsage (db_name sysname COLLATE DATABASE_DEFAULT NOT NULL PRIMARY KEY);
 
     DECLARE @db sysname;
     DECLARE @sql_usage nvarchar(max);

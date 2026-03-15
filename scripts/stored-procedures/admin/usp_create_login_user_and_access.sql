@@ -8,7 +8,7 @@ SET QUOTED_IDENTIFIER ON
 GO
 
 CREATE OR ALTER PROCEDURE [dbo].[usp_CreateLoginUserAndAccess]
-    @DbName         sysname,
+    @DbName         sysname = NULL,
     @Login          sysname = N'tabular_user',
     @Password       nvarchar(128) = NULL,          -- required when creating a new login or resetting
     @ResetPassword  bit = 0,
@@ -25,13 +25,98 @@ CREATE OR ALTER PROCEDURE [dbo].[usp_CreateLoginUserAndAccess]
     @KeepSchemaRole bit = 1,                        -- when ReplaceAccess=1: revoke old schema grants but keep role object
 
     -- Observability
-    @LogToTable     bit = 0                         -- write actions to dbo.provisioning_log
+    @LogToTable     bit = 0,                        -- write actions to dbo.provisioning_log
+
+    -- Help
+    @Help           bit = 0                         -- print usage examples and return
 AS
 BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT ON;
 
+    -----------------------------------------------------------------
+    -- Help / usage
+    -----------------------------------------------------------------
+    IF @Help = 1
+    BEGIN
+        PRINT N'=================================================================';
+        PRINT N'  usp_CreateLoginUserAndAccess';
+        PRINT N'  Creates a SQL login, maps it to a DB user, grants access.';
+        PRINT N'=================================================================';
+        PRINT N'';
+        PRINT N'PARAMETERS:';
+        PRINT N'  @DbName          sysname        (required) Target database';
+        PRINT N'  @Login           sysname        = N''tabular_user''';
+        PRINT N'  @Password        nvarchar(128)  = NULL (required for new login/reset)';
+        PRINT N'  @ResetPassword   bit            = 0';
+        PRINT N'  @AccessMode      nvarchar(30)   = N''DB_OWNER''';
+        PRINT N'      Options: DB_OWNER | READ_ALL | READWRITE_ALL | DDL_ADMIN';
+        PRINT N'               READ_SCHEMA | READWRITE_SCHEMA | NONE';
+        PRINT N'  @SchemaList      nvarchar(max)  = NULL (all non-system schemas)';
+        PRINT N'  @CustomRole      sysname        = NULL (auto-generated role name)';
+        PRINT N'  @RolePrefix      nvarchar(64)   = N''managed''';
+        PRINT N'  @IncludeExecute  bit            = 0 (EXECUTE on schemas)';
+        PRINT N'  @ReplaceAccess   bit            = 0 (revoke existing first)';
+        PRINT N'  @KeepSchemaRole  bit            = 1 (keep role object on replace)';
+        PRINT N'  @LogToTable      bit            = 0 (log to dbo.provisioning_log)';
+        PRINT N'';
+        PRINT N'EXAMPLES:';
+        PRINT N'';
+        PRINT N'  -- 1. Grant db_owner (defaults)';
+        PRINT N'  EXEC dbo.usp_CreateLoginUserAndAccess';
+        PRINT N'      @DbName = N''MyDB'', @Password = N''Strong!Pass1'';';
+        PRINT N'';
+        PRINT N'  -- 2. Read-only on specific schemas';
+        PRINT N'  EXEC dbo.usp_CreateLoginUserAndAccess';
+        PRINT N'      @DbName = N''MyDB'', @Login = N''report_user'',';
+        PRINT N'      @Password = N''Strong!Pass1'',';
+        PRINT N'      @AccessMode = N''READ_SCHEMA'', @SchemaList = N''dbo,sales'';';
+        PRINT N'';
+        PRINT N'  -- 3. Read-write on all schemas + EXECUTE';
+        PRINT N'  EXEC dbo.usp_CreateLoginUserAndAccess';
+        PRINT N'      @DbName = N''MyDB'', @Login = N''app_svc'',';
+        PRINT N'      @Password = N''Strong!Pass1'',';
+        PRINT N'      @AccessMode = N''READWRITE_SCHEMA'', @IncludeExecute = 1;';
+        PRINT N'';
+        PRINT N'  -- 4. Replace access, keep roles, log actions';
+        PRINT N'  EXEC dbo.usp_CreateLoginUserAndAccess';
+        PRINT N'      @DbName = N''MyDB'', @Login = N''app_svc'',';
+        PRINT N'      @AccessMode = N''READWRITE_SCHEMA'',';
+        PRINT N'      @SchemaList = N''dbo,inventory'',';
+        PRINT N'      @ReplaceAccess = 1, @KeepSchemaRole = 1, @LogToTable = 1;';
+        PRINT N'';
+        PRINT N'  -- 5. Reset password only';
+        PRINT N'  EXEC dbo.usp_CreateLoginUserAndAccess';
+        PRINT N'      @DbName = N''MyDB'', @Login = N''app_svc'',';
+        PRINT N'      @Password = N''NewStr0ng!Pass'',';
+        PRINT N'      @ResetPassword = 1, @AccessMode = N''NONE'';';
+        PRINT N'';
+        PRINT N'  -- 6. DDL admin';
+        PRINT N'  EXEC dbo.usp_CreateLoginUserAndAccess';
+        PRINT N'      @DbName = N''MyDB'', @Login = N''migration_svc'',';
+        PRINT N'      @Password = N''Strong!Pass1'', @AccessMode = N''DDL_ADMIN'';';
+        PRINT N'';
+        PRINT N'  -- 7. Custom role name';
+        PRINT N'  EXEC dbo.usp_CreateLoginUserAndAccess';
+        PRINT N'      @DbName = N''MyDB'', @Login = N''etl_user'',';
+        PRINT N'      @Password = N''Strong!Pass1'',';
+        PRINT N'      @AccessMode = N''READWRITE_SCHEMA'',';
+        PRINT N'      @SchemaList = N''staging,raw'',';
+        PRINT N'      @CustomRole = N''etl_data_access'';';
+        PRINT N'=================================================================';
+        RETURN;
+    END
+
     DECLARE @msg nvarchar(2048);
+
+    ---------------------------------------------------------------------------
+    -- @DbName is required for all non-help invocations
+    ---------------------------------------------------------------------------
+    IF @DbName IS NULL
+    BEGIN
+        PRINT N'[FAIL] @DbName is required. Run with @Help = 1 for usage examples.';
+        RETURN;
+    END;
 
     ---------------------------------------------------------------------------
     -- Version guard: requires SQL Server 2017+ (STRING_AGG, STRING_SPLIT)
@@ -268,9 +353,9 @@ BEGIN
         -- Clean managed schema roles (prefix + optional @CustomRole)
         -----------------------------------------------------------------
         IF OBJECT_ID('tempdb..#RolesToClean') IS NOT NULL DROP TABLE #RolesToClean;
-        CREATE TABLE #RolesToClean (RoleName sysname PRIMARY KEY);
+        CREATE TABLE #RolesToClean (RoleName sysname COLLATE DATABASE_DEFAULT PRIMARY KEY);
 
-        DECLARE @rolePrefix nvarchar(128) = LEFT(@RolePrefix + N'_' + @Login + N'_schema_access', 128);
+        DECLARE @rolePrefixFull nvarchar(128) = LEFT(@RolePrefix + N'_' + @Login + N'_schema_access', 128);
 
         DECLARE @sql_find_roles nvarchar(max) =
             N'USE ' + @DbQ + N';
@@ -283,7 +368,7 @@ BEGIN
         EXEC sys.sp_executesql
             @sql_find_roles,
             N'@pPrefix nvarchar(128)',
-            @pPrefix = @rolePrefix;
+            @pPrefix = @rolePrefixFull;
 
         IF @CustomRole IS NOT NULL AND LTRIM(RTRIM(@CustomRole)) <> N''
         BEGIN
@@ -525,7 +610,7 @@ BEGIN
 
         -- Build schema list into temp table
         IF OBJECT_ID('tempdb..#Schemas') IS NOT NULL DROP TABLE #Schemas;
-        CREATE TABLE #Schemas (SchemaName sysname PRIMARY KEY);
+        CREATE TABLE #Schemas (SchemaName sysname COLLATE DATABASE_DEFAULT PRIMARY KEY);
 
         DECLARE @sl nvarchar(max) = NULLIF(LTRIM(RTRIM(@SchemaList)), N'');
         IF @sl IS NULL
